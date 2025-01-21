@@ -18,7 +18,7 @@ def byteswap(bigend, profile = False):
         if profile: d.synchronize()
     return littleend
 
-def read_branch(filepath, branch, counts_, profile):
+def read_branch(filepath, branch, profile):
     if profile:
         time_s = time.monotonic()
     with open(filepath, "rb") as filehandle:
@@ -41,15 +41,7 @@ def read_branch(filepath, branch, counts_, profile):
 
         is_jagged = False
         if isinstance(branch.interpretation, uproot.interpretation.jagged.AsJagged):
-            #counts = counts_[branch.count_branch.name]
-            with cp.cuda.Device() as d:
-            #    offsets = cp.zeros(len(counts) + 1, dtype=cp.int32)
-            #    if profile: d.synchronize()
-            #    offsets[1:] = cp.cumsum(counts)
-            #    if profile: d.synchronize()
-                dtype  = branch.interpretation.content.from_dtype
-            #   content = cp.empty(offsets[-1].get(), dtype=dtype)
-            #   if profile: d.synchronize()
+            dtype  = branch.interpretation.content.from_dtype
             is_jagged = True
             
         elif isinstance(branch.interpretation, uproot.interpretation.numerical.AsDtype): 
@@ -65,14 +57,10 @@ def read_branch(filepath, branch, counts_, profile):
             for i in range(N_baskets):
                 if is_jagged:
                     pass
-                #    put_start = offsets[basket_entryoffsets[i]]
-                #    put_stop = offsets[basket_entryoffsets[i+1]]
                 else:
                     put_start = basket_entryoffsets[i]
                     put_stop = basket_entryoffsets[i+1]
                 
-                
-                #expected_entries = put_stop - put_start
                 ################
                 # Read uproot format1 header
                 filehandle.seek(basket_starts[i])
@@ -102,7 +90,6 @@ def read_branch(filepath, branch, counts_, profile):
     
                 # Check that border and expected entries agree
                 assert border <= fObjlen, f"{border} <= {fObjlen}"
-                #assert expected_entries == border // dtype.itemsize
                 
                 ################
                 #Read uproot format3 header
@@ -118,6 +105,7 @@ def read_branch(filepath, branch, counts_, profile):
                 output_buffers.append(output_buffer)
     
 
+                #################
                 # Align offset with multiple of 4096 bytes
                 # The GPU page size is 4kB, so all reads should be at an offset that is a multiple of 4096 bytes.
                 offset = (int(basket_starts[i] + fKeylen + format3.size) // 4096) * 4096
@@ -134,7 +122,9 @@ def read_branch(filepath, branch, counts_, profile):
                 with cp.cuda.Device() as d:
                     buffer = cp.empty(size_buffer, dtype = "b")
                     if profile: d.synchronize()
-                        
+
+                #################
+                # Read data into buffer
                 if profile & (i == 0):
                     start_gpu = cp.cuda.Event()
                     end_gpu = cp.cuda.Event()
@@ -177,12 +167,10 @@ def read_branch(filepath, branch, counts_, profile):
             "fKeylens": fKeylens_list,
             "fLasts": fLasts_list
         }
-    if profile:
-        time_e = time.monotonic()
-        print("{} took {} seconds to read".format(branch.name, time_e - time_s))
+
     return (compressed_contents, output_buffers, branch_metadata) 
 
-def assemble_arrays(branches, branches_metadatas, decompressed_content, counts, profile = False):
+def assemble_arrays(branches, branches_metadatas, decompressed_content, profile = False):
     # Assemble the branch arrays
     arrays = {}
     for i, branch in enumerate(branches):
@@ -204,7 +192,8 @@ def assemble_arrays(branches, branches_metadatas, decompressed_content, counts, 
             
             flattened_contents = cp.concatenate([contents.view(dtype)[:border // dtype.itemsize] 
                                                  for contents, border in zip(branch_decompressed_contents, borders)])
-            ######################################################################################################################
+            
+            ####################################
             # Get counts from the decompressed buffer
             offsets = [(byteswap(contents[border//dtype.itemsize:]).view(cp.int32)[1:] - fKeylen) 
                                                  for contents, border, fKeylen in zip(branch_decompressed_contents, borders, fKeylens_list)]
@@ -226,14 +215,15 @@ def assemble_arrays(branches, branches_metadatas, decompressed_content, counts, 
                 put_starts[i] = flattened_offsets[basket_entryoffsets[i]]
                 put_stops[i] = flattened_offsets[basket_entryoffsets[i+1]]
             
-            counts_ = cp.diff(flattened_offsets)
+            counts = cp.diff(flattened_offsets)
             content = cp.empty(flattened_offsets[-1].get(), dtype=dtype)          
-            ######################################################################################################################
+            #########################################################
+            
             content[put_starts[0]:put_stops[-1]] = flattened_contents
 
-            # Root is big-endian, but nvidia only support little-endian
+            # Root is big-endian, nvidia only supports little-endian
             content = byteswap(content, profile)
-            arrays[branch.name] = ak.unflatten(content.astype(cp.float32), counts_)
+            arrays[branch.name] = ak.unflatten(content.astype(cp.float32), counts)
             # Slice out used chunks
             decompressed_content = decompressed_content[N_baskets:]
             
@@ -254,7 +244,7 @@ def assemble_arrays(branches, branches_metadatas, decompressed_content, counts, 
     
     return(arrays)
 
-def GPU_CuFile_all_baskets_to_array(filepath, branches, profile, counts_call = False):
+def GPU_CuFile_all_baskets_to_array(filepath, branches, profile):
     #kvikio.defaults.num_threads_reset(1)          # default = 1
     #kvikio.defaults.gds_threshold_reset(1048576) # default = 1048576
     
@@ -263,14 +253,13 @@ def GPU_CuFile_all_baskets_to_array(filepath, branches, profile, counts_call = F
     branches_metadatas = {}
     output_buffers = []
     all_compressed_content = []
-    counts = None
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
         for i, branch in enumerate(branches):
             futures.append(
                 executor.submit(
-                    read_branch, filepath, branch, counts, profile
+                    read_branch, filepath, branch, profile
                 )
             )
         for i, future in enumerate(futures):
@@ -278,12 +267,13 @@ def GPU_CuFile_all_baskets_to_array(filepath, branches, profile, counts_call = F
             all_compressed_content.extend(compressed_content)
             output_buffers.extend(output_buffers_temp)
             branches_metadatas[branches[i].name] = branch_metadata
+    
     # Decompress the data on the GPU
     codec = NvCompBatchCodec("zstd")
     all_decompressed_content = codec.decode_batch(all_compressed_content, output_buffers)
 
     # Assemble the branch arrays
-    arrays = assemble_arrays(branches, branches_metadatas, all_decompressed_content, counts, profile)
+    arrays = assemble_arrays(branches, branches_metadatas, all_decompressed_content, profile)
 
     return(arrays)
 
