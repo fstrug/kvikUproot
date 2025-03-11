@@ -1,5 +1,6 @@
 from kvikio.nvcomp_codec import NvCompBatchCodec
 from kvikio import defaults, CuFile
+from dataclasses_RNTuple import *
 import uproot
 import numpy as np
 import numpy
@@ -18,124 +19,14 @@ def _recursive_find(form, res):
     if hasattr(form, "content") and issubclass(type(form.content), ak.forms.Form):
         _recursive_find(form.content, res)
 
-def GPU_read_col_cluster_pages(in_ntuple, ncol, cluster_i, filehandle):
-    linklist = in_ntuple.page_list_envelopes.pagelinklist[cluster_i]
-    pagelist = linklist[ncol].pages if ncol < len(linklist) else []
-    dtype_byte = in_ntuple.column_records[ncol].type
-    dtype_str = uproot.const.rntuple_col_num_to_dtype_dict[dtype_byte]
-    total_len = np.sum([desc.num_elements for desc in pagelist], dtype=int)
-    if dtype_str == "switch":
-        dtype = np.dtype([("index", "int64"), ("tag", "int32")])
-    elif dtype_str == "bit":
-        dtype = np.dtype("bool")
-    else:
-        dtype = np.dtype(dtype_str)
-    full_output_buffer = cp.empty(total_len, dtype = dtype)    
-    split = dtype_byte in uproot.const.rntuple_split_types
-    
-
-    n_pages = len(pagelist)
-    output_buffers = []
-    compressed_buffers = []
-    futures = []
-
-    tracker = 0
-    nelements_tracker = 0
-    for page_desc in pagelist:
-        n_elements = page_desc.num_elements
-        loc = page_desc.locator
-        n_bytes = loc.num_bytes
-        isbit = dtype_str == "bit"
-        len_divider = 8 if isbit else 1
-        num_elements = n_elements
-        if isbit:
-            num_elements_toread = int(numpy.ceil(num_elements / 8))
-        elif dtype_str in ("real32trunc", "real32quant"):
-            num_elements_toread = int(numpy.ceil((num_elements * 4 * nbits) / 32))
-            dtype = numpy.dtype("uint8")
-        else:
-            num_elements_toread = num_elements
-        nelements_tracker += num_elements_toread
-        uncomp_size = num_elements_toread * dtype.itemsize
-        tracker_end = tracker + num_elements_toread
-        out_buff = full_output_buffer[tracker:tracker_end]
-        # print("Page {} base buffer ID: ".format(i) ,id(out_buff.base))
-        # Use locator to read page
-        comp_buff = cp.empty(n_bytes - 9, dtype = "b")
-        fut = filehandle.pread(comp_buff,
-                              size = int(n_bytes - 9),
-                              file_offset = int(loc.offset + 9))
-
-
-        output_buffers.append(out_buff)
-        compressed_buffers.append(comp_buff)
-        futures.append(fut)
-        tracker = tracker_end
-    # Because some columns contain extra bits in the compressed buffer that 
-    # get 'chopped' off, need to check that total_len == sum(num_elements_to_read)
-    # for prototype for now. Only relevant for cols with (isBit = True)
-    # assert(total_len == nelements_tracker)
-    
-    #for future in futures:
-    #    future.get()
-            
-    return (compressed_buffers, output_buffers, futures, full_output_buffer)
-    
-        
-    
-def GPU_read_col_clusters(in_ntuple, ncol, cluster_range, dtype_byte):
-    filepath = in_ntuple.file.source.file_path
-    compressed_buffers = []
-    output_buffers = []
-    futures = []
-    cluster_output_buffers = []
-    #print("Reading column {}".format(ncol))
-    with CuFile(filepath, "rb") as filehandle:
-        for i, cluster_i in enumerate(cluster_range):
-            (cluster_compressed_buffers,
-             page_output_buffers,
-             cluster_futures,
-             cluster_full_output_buffer) = GPU_read_col_cluster_pages(in_ntuple,
-                                                                ncol,
-                                                                cluster_i,
-                                                                filehandle)
-            # print("Cluster {} output buffer ID after return".format(cluster_i), id(cluster_full_output_buffer))
-            # print("Page base output buffer ID after return", id(page_output_buffers[0].base))
-            # Aggregate results
-            compressed_buffers.extend(cluster_compressed_buffers)
-            output_buffers.extend(page_output_buffers)
-            futures.extend(cluster_futures)
-            cluster_output_buffers.append(cluster_full_output_buffer)
-            # print("Cluster {} output buffer ID after append into aggregate list".format(cluster_i), id(cluster_output_buffers[0]))
-            # print("Page base output buffer ID after extend into aggregate list", id(output_buffers[0].base))
-        for future in futures:
-            future.get()
-    return (compressed_buffers, output_buffers, cluster_output_buffers)
-    
-
-def GPU_read_cols(in_ntuple, columns, start_cluster_idx, stop_cluster_idx):
-    compressed_buffers = []
-    all_page_output_buffers = []
-    all_cluster_output_buffers = []
-    for key in columns:
-        if "column" in key and "union" not in key:
-            key_nr = int(key.split("-")[1])
-            dtype_byte = in_ntuple.ntuple.column_records[key_nr].type
-            cluster_range = range(start_cluster_idx, stop_cluster_idx)
-            
-            (compressed_buffers_col,
-             page_output_buffers_col,
-             cluster_output_buffers)= GPU_read_col_clusters(in_ntuple,
-                                                                       key_nr,
-                                                                       cluster_range,
-                                                                       dtype_byte)
-            compressed_buffers.extend(compressed_buffers_col)
-            all_page_output_buffers.extend(page_output_buffers_col)
-            all_cluster_output_buffers.extend(cluster_output_buffers)
-            
-    #print(len(compressed_buffers), len(output_buffers))
-    #print(compressed_buffers, output_buffers)
-    return(compressed_buffers, all_page_output_buffers, all_cluster_output_buffers)
+def cupy_insert0(arr):
+    #Intended for flat cupy arrays
+    array_len = arr.shape[0]
+    array_dtype = arr.dtype
+    out_arr = cp.empty(array_len + 1, dtype = array_dtype)
+    cp.copyto(out_arr[1:], arr)
+    out_arr[0] = 0
+    return(out_arr)
 
 
 def process_page_decompressed_buffer(destination, desc, dtype_str, dtype, nbits, split):
@@ -143,6 +34,7 @@ def process_page_decompressed_buffer(destination, desc, dtype_str, dtype, nbits,
     # bool in RNTuple is always stored as bits
     isbit = dtype_str == "bit"
     num_elements = len(destination)
+        
     if split:
         content = cp.copy(destination).view(cp.uint8)
 
@@ -150,38 +42,39 @@ def process_page_decompressed_buffer(destination, desc, dtype_str, dtype, nbits,
             # AAAAABBBBB needs to become
             # ABABABABAB
             res = cp.empty(len(content), cp.uint8)
-            res[0::2] = content[len(res) * 0 // 2 : len(res) * 1 // 2]
-            res[1::2] = content[len(res) * 1 // 2 : len(res) * 2 // 2]
+            length = len(res)
+            res[0::2] = content[length * 0 // 2 : length * 1 // 2]
+            res[1::2] = content[length * 1 // 2 : length * 2 // 2]
 
         elif nbits == 32:
             # AAAAABBBBBCCCCCDDDDD needs to become
             # ABCDABCDABCDABCDABCD
             res = cp.empty(len(content), cp.uint8)
-            res[0::4] = content[len(res) * 0 // 4 : len(res) * 1 // 4]
-            res[1::4] = content[len(res) * 1 // 4 : len(res) * 2 // 4]
-            res[2::4] = content[len(res) * 2 // 4 : len(res) * 3 // 4]
-            res[3::4] = content[len(res) * 3 // 4 : len(res) * 4 // 4]
+            length = len(res)
+            res[0::4] = content[length * 0 // 4 : length * 1 // 4]
+            res[1::4] = content[length * 1 // 4 : length * 2 // 4]
+            res[2::4] = content[length * 2 // 4 : length * 3 // 4]
+            res[3::4] = content[length * 3 // 4 : length * 4 // 4]
 
         elif nbits == 64:
             # AAAAABBBBBCCCCCDDDDDEEEEEFFFFFGGGGGHHHHH needs to become
             # ABCDEFGHABCDEFGHABCDEFGHABCDEFGHABCDEFGH
             res = cp.empty(len(content), cp.uint8)
-            res[0::8] = content[len(res) * 0 // 8 : len(res) * 1 // 8]
-            res[1::8] = content[len(res) * 1 // 8 : len(res) * 2 // 8]
-            res[2::8] = content[len(res) * 2 // 8 : len(res) * 3 // 8]
-            res[3::8] = content[len(res) * 3 // 8 : len(res) * 4 // 8]
-            res[4::8] = content[len(res) * 4 // 8 : len(res) * 5 // 8]
-            res[5::8] = content[len(res) * 5 // 8 : len(res) * 6 // 8]
-            res[6::8] = content[len(res) * 6 // 8 : len(res) * 7 // 8]
-            res[7::8] = content[len(res) * 7 // 8 : len(res) * 8 // 8]
+            length = len(res)
+            res[0::8] = content[length * 0 // 8 : length * 1 // 8]
+            res[1::8] = content[length * 1 // 8 : length * 2 // 8]
+            res[2::8] = content[length * 2 // 8 : length * 3 // 8]
+            res[3::8] = content[length * 3 // 8 : length * 4 // 8]
+            res[4::8] = content[length * 4 // 8 : length * 5 // 8]
+            res[5::8] = content[length * 5 // 8 : length * 6 // 8]
+            res[6::8] = content[length * 6 // 8 : length * 7 // 8]
+            res[7::8] = content[length * 7 // 8 : length * 8 // 8]
 
         content = res.view(dtype)
 
     if isbit:
-        content = (
-            cp.unpackbits(content.view(dtype=cp.uint8))
-            .reshape(-1, 8)[:, ::-1]
-            .reshape(-1)
+        content = cp.unpackbits(
+            destination.view(dtype=cp.uint8), bitorder="little"
         )
     elif dtype_str in ("real32trunc", "real32quant"):
         if nbits == 32:
@@ -208,7 +101,7 @@ def process_page_decompressed_buffer(destination, desc, dtype_str, dtype, nbits,
 
 def Process_decompressed_content(in_ntuple, columns,
                                  start_cluster_idx, stop_cluster_idx,
-                                 all_cluster_decompressed_buffers):
+                                 clusters_datas):
 
     cluster_range = range(start_cluster_idx, stop_cluster_idx)
     n_clusters = stop_cluster_idx - start_cluster_idx
@@ -216,11 +109,10 @@ def Process_decompressed_content(in_ntuple, columns,
     j = 0
     for key in columns:
         if "column" in key and "union" not in key:
-            # Get decompressed array for key for all clusters
-            col_decompressed_buffers = all_cluster_decompressed_buffers[j*(n_clusters):(j+1)*n_clusters]
+            # Get uncompressed array for key for all clusters
             j += 1
             key_nr = int(key.split("-")[1])
-            #print("Processing key {} buffers".format(key_nr))
+            col_decompressed_buffers = clusters_datas.grab_ColOutput(key_nr)
             dtype_byte = in_ntuple.ntuple.column_records[key_nr].type
             arrays = []
             ncol = key_nr
@@ -245,7 +137,11 @@ def Process_decompressed_content(in_ntuple, columns,
                 zigzag = dtype_byte in uproot.const.rntuple_zigzag_types
                 delta = dtype_byte in uproot.const.rntuple_delta_types
                 index = dtype_byte in uproot.const.rntuple_index_types
-                nbits = uproot.const.rntuple_col_num_to_size_dict[dtype_byte]
+                nbits = (
+                    in_ntuple.column_records[ncol].nbits
+                    if ncol < len(in_ntuple.column_records)
+                    else uproot.const.rntuple_col_num_to_size_dict[dtype_byte]
+                    )
                 
                 # Begin looping through pages
                 tracker = 0
@@ -309,18 +205,97 @@ def Process_decompressed_content(in_ntuple, columns,
     
     return col_arrays
 
-def cupy_insert0(arr):
-    #Intended for flat cupy arrays
-    array_len = arr.shape[0]
-    array_dtype = arr.dtype
-    out_arr = cp.empty(array_len + 1, dtype = array_dtype)
-    cp.copyto(out_arr[1:], arr)
-    out_arr[0] = 0
-    return(out_arr)
-                    
+def GPU_read_col_cluster_pages(in_ntuple, ncol, cluster_i, filehandle):
+    # Get cluster and pages metadatas
+    linklist = in_ntuple.page_list_envelopes.pagelinklist[cluster_i]
+    pagelist = linklist[ncol].pages if ncol < len(linklist) else []
+    dtype_byte = in_ntuple.column_records[ncol].type
+    split = dtype_byte in uproot.const.rntuple_split_types
+    dtype_str = uproot.const.rntuple_col_num_to_dtype_dict[dtype_byte]
+    isbit = dtype_str == "bit"
+    # Prepare full output buffer
+    total_len = np.sum([desc.num_elements for desc in pagelist], dtype=int)
+    if dtype_str == "switch":
+        dtype = np.dtype([("index", "int64"), ("tag", "int32")])
+    elif dtype_str == "bit":
+        dtype = np.dtype("bool")
+    else:
+        dtype = np.dtype(dtype_str)
+    full_output_buffer = cp.empty(total_len, dtype = dtype)    
 
+    # Check if col compressed/decompressed
+    if isbit: # Need to correct length when dtype = bit
+        total_len = int(numpy.ceil(total_len / 8))    
+    total_bytes = np.sum([desc.locator.num_bytes for desc in pagelist])
+    if (total_bytes != total_len * dtype.itemsize):
+        isCompressed = True
+    else:
+        isCompressed = False
+    Cluster_Contents = ColBuffers_Cluster(ncol,
+                                          full_output_buffer,
+                                          isCompressed)
+    
+    tracker = 0
+    futures = []
+    for page_desc in pagelist:
+        num_elements = page_desc.num_elements
+        loc = page_desc.locator
+        n_bytes = loc.num_bytes
+        tracker_end = tracker + num_elements
+        out_buff = full_output_buffer[tracker:tracker_end]
+        # If compressed, skip 9 byte header
+        if isCompressed:
+            comp_buff = cp.empty(n_bytes - 9, dtype = "b")
+            fut = filehandle.pread(comp_buff,
+                                  size = int(n_bytes - 9),
+                                  file_offset = int(loc.offset+9))
+        
+        # If uncompressed, read directly into out_buff
+        else:
+            comp_buff = None
+            fut = filehandle.pread(out_buff,
+                                  size = int(n_bytes),
+                                  file_offset = int(loc.offset))
+
+        Cluster_Contents.add_page(comp_buff)
+        Cluster_Contents.add_output(out_buff)
+        futures.append(fut)
+        tracker = tracker_end
             
-def kvikuproot_open_RNTuple(in_ntuple_path, columns, classname, prototype = True, entry_start = 0, entry_stop = None):
+    return (Cluster_Contents, futures)
+
+def GPU_read_clusters(in_ntuple, columns, start_cluster_idx, stop_cluster_idx):
+    cluster_range = range(start_cluster_idx, stop_cluster_idx)
+    clusters_datas = Cluster_Refs()
+    # Iterate through each cluster
+    for cluster_i in cluster_range:
+        with CuFile(in_ntuple.file.source.file_path, "rb") as filehandle:
+            futures = []
+            cluster_colrefs = Cluster_ColRefs(cluster_i)
+            #Open filehandle and read columns for cluster
+        
+            for key in columns:
+                if "column" in key and "union" not in key:
+                    key_nr = int(key.split("-")[1])
+    
+                    (Col_ClusterBuffers,
+                     future)           = GPU_read_col_cluster_pages(in_ntuple,
+                                                                    key_nr,
+                                                                    cluster_i,
+                                                                    filehandle)
+                    futures.extend(future)
+                    cluster_colrefs.add_Col(Col_ClusterBuffers)
+            for future in futures:
+                future.get()
+
+        cluster_colrefs.decompress()
+        clusters_datas.add_cluster(cluster_colrefs)
+    
+    return(clusters_datas)    
+
+
+
+def kvikUproot_openGPU(in_ntuple_path, columns, classname, prototype = True, entry_start = 0, entry_stop = None):
     in_ntuple = uproot.open(in_ntuple_path)[classname]
     entry_stop = entry_stop or in_ntuple.ntuple.num_entries
     
@@ -346,38 +321,19 @@ def kvikuproot_open_RNTuple(in_ntuple_path, columns, classname, prototype = True
     container_dict = {}
     _recursive_find(form, target_cols)
 
-
-    #print("Begin reading")
     # Read all columns 'compressed' data
-    (all_compressed_buffers,
-     all_output_buffers,
-     all_cluster_output_buffers) = GPU_read_cols(in_ntuple,
-                                                 target_cols,
-                                                 start_cluster_idx,
-                                                 stop_cluster_idx)
-    #print("Reading complete")
+    clusters_datas = GPU_read_clusters(in_ntuple,
+                                       target_cols,
+                                       start_cluster_idx,
+                                       stop_cluster_idx)
 
-    # Decompression GPU
-    #print("\nGPU decompression")
-    codec = NvCompBatchCodec("zstd")
-    codec.decode_batch(all_compressed_buffers, all_output_buffers)
-    #print("GPU decompression complete")
-
-    #print("Process decompressed data")
     content_dict = Process_decompressed_content(in_ntuple,
                                           target_cols,
                                           start_cluster_idx,
                                           stop_cluster_idx,
-                                          all_cluster_output_buffers)
-    #if prototype:
-    #    return(content_dict, form)
+                                          clusters_datas)
 
-    # Pick back up here
     container_dict = {}
-
-
-    # return(ak.unflatten(content, cp.diff(offsets))) 
-    
     # Debugging
     for key in target_cols:
         if "column" in key and "union" not in key:
@@ -415,30 +371,3 @@ def kvikuproot_open_RNTuple(in_ntuple_path, columns, classname, prototype = True
         form, cluster_num_entries, container_dict, allow_noncanonical_form=True,
         backend = "cuda"
     )[entry_start:entry_stop]
-
-def GPU_akzip_RNTuple(container_dict, form):
-    # Associate content/offsets with their keys
-    arrays = {}
-
-    form_contents = form.contents
-    for i, field in enumerate(form.fields):
-        field_content = form_contents[i]
-
-        # if field_content is instance(ak.forms.NumpyForm):
-        
-        if isinstance(field_content, ak.forms.ListOffsetForm):
-            offsets_key = int(field_content.form_key.split("-")[1])
-            content_key = int(field_content.content.form_key.split("-")[1])
-            array_ = ak.unflatten(container_dict[content_key], cp.diff(container_dict[offsets_key]))
-            arrays[field] = array_
-        elif isinstance(field_content, ak.forms.NumpyForm):
-            content_key = int(field_content.form_key.split("-")[1])
-            arrays[field] = ak.Array(container_dict[content_key])
-    
-    return(ak.zip(arrays, depth_limit = 1))
-
-def kvikUproot_openGPU(in_ntuple_path, columns, classname):
-    events_RNTuple_GPU = kvikuproot_open_RNTuple(in_ntuple_path, columns, classname)
-    # events_RNTuple_GPU = GPU_akzip_RNTuple(content_dict, form)
-
-    return(events_RNTuple_GPU)
